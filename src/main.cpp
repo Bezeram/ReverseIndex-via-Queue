@@ -43,7 +43,7 @@ struct ThreadBucket
     int TotalSize = 0;
 };
 
-void DistributeDatasets(const vector<FileBucket>& fileBuckets, int mapperThreadsCount, vector<ThreadBucket>& threadBuckets)
+void AssignFilesToThreads(const vector<FileBucket>& fileBuckets, int mapperThreadsCount, vector<ThreadBucket>& threadBuckets)
 {
     // Calculate average file size
     float averageFilesize = 0;
@@ -54,22 +54,22 @@ void DistributeDatasets(const vector<FileBucket>& fileBuckets, int mapperThreads
     averageFilesize /= fileBuckets.size();
 
     // Sort files by size
-    vector<FileBucket> sortedFileBuckets = fileBuckets; // Make a copy to sort
+    vector<FileBucket> sortedFileBuckets = fileBuckets;
     std::sort(sortedFileBuckets.begin(), sortedFileBuckets.end(), [](const FileBucket& a, const FileBucket& b) {
         return a.Size < b.Size;
     });
 
     int idxThread = 0;
     int idxFile = 0;
-    while (idxThread < mapperThreadsCount && idxFile < sortedFileBuckets.size())
+    while (idxFile < sortedFileBuckets.size())
     {
-        while (threadBuckets[idxThread].TotalSize + sortedFileBuckets[idxFile].Size <= averageFilesize)
+        if (threadBuckets[idxThread].TotalSize + sortedFileBuckets[idxFile].Size <= averageFilesize)
         {
             threadBuckets[idxThread].Files.push_back(sortedFileBuckets[idxFile].File);
             threadBuckets[idxThread].TotalSize += sortedFileBuckets[idxFile].Size;
             idxFile++;
         }
-        idxThread++;
+        idxThread = (idxThread + 1) % mapperThreadsCount;
 
         // If the current file bucket is larger than the average size,
         // just add the rest of the buckets to the threads evenly
@@ -101,8 +101,18 @@ int main(int argc, char **argv)
     vector<FileBucket> fileBuckets = ReadDatasetNames(inputFile);
 
     vector<ThreadBucket> threadBuckets(mapperThreadsCount);
-    DistributeDatasets(fileBuckets, mapperThreadsCount, threadBuckets);
+    AssignFilesToThreads(fileBuckets, mapperThreadsCount, threadBuckets);
 
-    
+    // print the thread buckets with their files
+    for (int i = 0; i < mapperThreadsCount; i++)
+    {
+        cout << "Thread " << i << ":\n";
+        for (const string& file : threadBuckets[i].Files)
+        {
+            cout << file << endl;
+        }
+        cout << "Total size: " << threadBuckets[i].TotalSize << endl;
+        cout << endl;
+    }
     return 0;
 }
