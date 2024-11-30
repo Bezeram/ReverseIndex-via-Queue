@@ -25,17 +25,25 @@ struct Chunk {
     int FileID; // Unique ID for the file
 };
 
-// Thread memory for mapping and reducing phase
-struct ThreadMemory {
+// Thread memory for mapping phase
+struct MapperThreadMemory {
     int ThreadID;
     int MapperThreadsCount;
-    int ReducerThreadsCount;
     vector<FileBucket>* FileBuckets;
     vector<map<string, vector<int>>>* PartialIndexes;
     pthread_barrier_t* MapperReducerBarrier;
     queue<Chunk>* ChunkQueue;
-    queue<map<string, vector<int>>>* ReduceQueue;
     mutex* ChunkMutex;
+};
+
+// Thread memory for reducing phase
+struct ReducerThreadMemory {
+    int ThreadID;
+    int MapperThreadsCount;
+    int ReducerThreadsCount;
+    vector<map<string, vector<int>>>* PartialIndexes;
+    pthread_barrier_t* MapperReducerBarrier;
+    queue<map<string, vector<int>>>* ReduceQueue;
     mutex* ReduceMutex;
 };
 
@@ -88,56 +96,56 @@ void CombineMaps(map<string, vector<int>>& map1, const map<string, vector<int>>&
     }
 }
 
-// Worker thread function for both mapping and reducing
-void* WorkerThread(void* args) {
-    ThreadMemory* threadMemory = (ThreadMemory*)args;
+// Mapper thread function
+void* MapThread(void* args) {
+    MapperThreadMemory* threadMemory = (MapperThreadMemory*)args;
 
-    // Mapping phase (if thread ID is less than mapper thread count)
-    if (threadMemory->ThreadID < threadMemory->MapperThreadsCount) {
-        while (true) {
-            threadMemory->ChunkMutex->lock();
-            if (threadMemory->ChunkQueue->empty()) {
-                threadMemory->ChunkMutex->unlock();
-                break; // No more chunks
-            }
-            Chunk chunk = threadMemory->ChunkQueue->front();
-            threadMemory->ChunkQueue->pop();
+    while (true) {
+        threadMemory->ChunkMutex->lock();
+        if (threadMemory->ChunkQueue->empty()) {
             threadMemory->ChunkMutex->unlock();
-
-            // Map the chunk
-            Map(chunk, (*threadMemory->PartialIndexes)[threadMemory->ThreadID]);
+            break; // No more chunks
         }
+        Chunk chunk = threadMemory->ChunkQueue->front();
+        threadMemory->ChunkQueue->pop();
+        threadMemory->ChunkMutex->unlock();
 
-        // Barrier to synchronize threads after mapping phase
-        pthread_barrier_wait(threadMemory->MapperReducerBarrier);
+        // Map the chunk
+        Map(chunk, (*threadMemory->PartialIndexes)[threadMemory->ThreadID]);
     }
 
-    // Reducing phase (if thread ID is >= mapper thread count)
-    if (threadMemory->ThreadID >= threadMemory->MapperThreadsCount) {
-        while (true) {
-            map<string, vector<int>> map1, map2;
+    // Barrier to synchronize threads after mapping phase
+    pthread_barrier_wait(threadMemory->MapperReducerBarrier);
+    return NULL;
+}
 
-            threadMemory->ReduceMutex->lock();
-            if (threadMemory->ReduceQueue->size() < 2) {
-                threadMemory->ReduceMutex->unlock();
-                break; // Not enough maps to process
-            }
+// Reducer thread function
+void* ReduceThread(void* args) {
+    ReducerThreadMemory* threadMemory = (ReducerThreadMemory*)args;
 
-            // Get two maps from the queue
-            map1 = move(threadMemory->ReduceQueue->front());
-            threadMemory->ReduceQueue->pop();
-            map2 = move(threadMemory->ReduceQueue->front());
-            threadMemory->ReduceQueue->pop();
+    while (true) {
+        map<string, vector<int>> map1, map2;
+
+        threadMemory->ReduceMutex->lock();
+        if (threadMemory->ReduceQueue->size() < 2) {
             threadMemory->ReduceMutex->unlock();
-
-            // Combine the maps
-            CombineMaps(map1, map2);
-
-            // Push the combined map back into the queue
-            threadMemory->ReduceMutex->lock();
-            threadMemory->ReduceQueue->push(move(map1));
-            threadMemory->ReduceMutex->unlock();
+            break; // Not enough maps to process
         }
+
+        // Get two maps from the queue
+        map1 = move(threadMemory->ReduceQueue->front());
+        threadMemory->ReduceQueue->pop();
+        map2 = move(threadMemory->ReduceQueue->front());
+        threadMemory->ReduceQueue->pop();
+        threadMemory->ReduceMutex->unlock();
+
+        // Combine the maps
+        CombineMaps(map1, map2);
+
+        // Push the combined map back into the queue
+        threadMemory->ReduceMutex->lock();
+        threadMemory->ReduceQueue->push(move(map1));
+        threadMemory->ReduceMutex->unlock();
     }
 
     return NULL;
@@ -190,11 +198,19 @@ int main(int argc, char** argv) {
 
     // Create all threads (both mapping and reducing)
     vector<pthread_t> threads(mapperThreadsCount + reducerThreadsCount);
-    vector<ThreadMemory> threadMemories(mapperThreadsCount + reducerThreadsCount);
+    vector<MapperThreadMemory> mapperMemories(mapperThreadsCount);
+    vector<ReducerThreadMemory> reducerMemories(reducerThreadsCount);
 
-    for (int i = 0; i < mapperThreadsCount + reducerThreadsCount; i++) {
-        threadMemories[i] = {i, mapperThreadsCount, reducerThreadsCount, &fileBuckets, &partialIndexes, &barrier, &chunkQueue, &reduceQueue, &chunkMutex, &reduceMutex};
-        pthread_create(&threads[i], nullptr, WorkerThread, (void*)&threadMemories[i]);
+    // Create mapper threads
+    for (int i = 0; i < mapperThreadsCount; i++) {
+        mapperMemories[i] = {i, mapperThreadsCount, &fileBuckets, &partialIndexes, &barrier, &chunkQueue, &chunkMutex};
+        pthread_create(&threads[i], nullptr, MapThread, (void*)&mapperMemories[i]);
+    }
+
+    // Create reducer threads
+    for (int i = 0; i < reducerThreadsCount; i++) {
+        reducerMemories[i] = {i + mapperThreadsCount, mapperThreadsCount, reducerThreadsCount, &partialIndexes, &barrier, &reduceQueue, &reduceMutex};
+        pthread_create(&threads[mapperThreadsCount + i], nullptr, ReduceThread, (void*)&reducerMemories[i]);
     }
 
     // Wait for threads to complete
