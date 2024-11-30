@@ -4,171 +4,135 @@
 #include <pthread.h>
 #include <string>
 #include <vector>
+#include <queue>
+#include <mutex>
 #include <cctype>
 #include <algorithm>
 
 using namespace std;
 
-struct FileBucket
-{
+// Represents metadata about a file (name and size)
+struct FileBucket {
     string File;
     int Size;
 };
 
-vector<FileBucket> ReadDatasetNames(const string& inputPath)
-{
-    ifstream fin(inputPath);
+// Represents a chunk of a file (portion to be processed)
+struct Chunk {
+    string File;
+    int Start; // Start byte
+    int End;   // End byte
+    int FileID; // Unique ID for the file
+};
 
+// Global queue of chunks and mutex for synchronization
+queue<Chunk> chunkQueue;
+mutex chunkMutex;
+
+// Reads dataset file names and sizes from the input file
+vector<FileBucket> ReadDatasetNames(const string& inputPath) {
+    ifstream fin(inputPath);
     vector<FileBucket> datasetNames;
+
     int n;
     fin >> n;
-    for (int i = 0; i < n; i++)
-    {
+    for (int i = 0; i < n; i++) {
         string datasetName;
         fin >> datasetName;
 
         // Get file size
-        ifstream fin(datasetName);
-        fin.seekg(0, ios::end);
-        int fileSize = fin.tellg();
+        ifstream fileStream(datasetName, ios::binary | ios::ate);
+        int fileSize = fileStream.tellg();
 
-        datasetNames.push_back({ datasetName, fileSize });
+        datasetNames.push_back({datasetName, fileSize});
     }
-
     return datasetNames;
 }
 
-struct ThreadBucket
-{
-    vector<string> Files;
-    int TotalSize = 0;
+// Thread memory for mapping phase
+struct ThreadMemory {
+    int ThreadID;
+    vector<map<string, vector<int>>>* PartialIndexes; // Updated for file IDs
+    pthread_barrier_t* MapperBarrier;
 };
 
-typedef map<string, int> InverseIndexMap;
-
-struct ThreadMemory
-{
-    ThreadMemory(string file, int mapID, int reduceIDStart, int reduceIDStop, vector<InverseIndexMap>& inverseIndexes, pthread_barrier_t& mapperBarrier)
-        : File(file), MapID(mapID), ReduceIDStart(reduceIDStart), ReduceIDStop(reduceIDStop), InverseIndexes(inverseIndexes), MapperBarrier(mapperBarrier) {}
-    string File;
-    int MapID;
-    int ReduceIDStart, ReduceIDStop;
-
-    vector<InverseIndexMap>& InverseIndexes;
-    pthread_barrier_t& MapperBarrier;
-};
-
-void AssignFilesToThreads(const vector<FileBucket>& fileBuckets, int mapperThreadsCount, vector<ThreadBucket>& threadBuckets)
-{
-    // Calculate average file size
-    float averageFilesize = 0;
-    for (const FileBucket& d : fileBuckets)
-    {
-        averageFilesize += d.Size;
-    }
-    averageFilesize /= fileBuckets.size();
-
-    // Sort files by size
-    vector<FileBucket> sortedFileBuckets = fileBuckets;
-    std::sort(sortedFileBuckets.begin(), sortedFileBuckets.end(), [](const FileBucket& a, const FileBucket& b) {
-        return a.Size < b.Size;
-    });
-
-    int idxThread = 0;
-    int idxFile = 0;
-    while (idxFile < sortedFileBuckets.size())
-    {
-        if (threadBuckets[idxThread].TotalSize + sortedFileBuckets[idxFile].Size <= averageFilesize)
-        {
-            threadBuckets[idxThread].Files.push_back(sortedFileBuckets[idxFile].File);
-            threadBuckets[idxThread].TotalSize += sortedFileBuckets[idxFile].Size;
-            idxFile++;
+// Adds file chunks to the global queue for processing
+void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize) {
+    for (int fileID = 0; fileID < fileBuckets.size(); fileID++) {
+        const auto& file = fileBuckets[fileID];
+        int start = 0;
+        while (start < file.Size) {
+            int end = min(start + chunkSize, file.Size);
+            chunkQueue.push({file.File, start, end, fileID});
+            start = end;
         }
-        idxThread = (idxThread + 1) % mapperThreadsCount;
-
-        // If the current file bucket is larger than the average size,
-        // just add the rest of the buckets to the threads evenly
-        if (sortedFileBuckets[idxFile].Size > averageFilesize)
-            break;
-    }
-    // Assign the rest of the files
-    while (idxFile < sortedFileBuckets.size())
-    {
-        threadBuckets[idxThread].Files.push_back(sortedFileBuckets[idxFile].File);
-        threadBuckets[idxThread].TotalSize += sortedFileBuckets[idxFile].Size;
-        idxFile++;
-        idxThread = (idxThread + 1) % mapperThreadsCount;
     }
 }
 
-void Map(const string& file, ThreadMemory* input)
-{
-    ifstream fin(input->File);
-    InverseIndexMap& threadMap = (*input->InverseIndexes)[input->MapID];
+// Maps a chunk to an inverse index
+void Map(Chunk chunk, map<string, vector<int>>& partialIndex) {
+    ifstream fin(chunk.File);
+    fin.seekg(chunk.Start);
+    string word;
 
-    while (!fin.eof())
-    {
-        string word;
-        fin >> word;
-        // Erase everything which isn't alphabet letters
-        for (int i = 0; i < word.size();)
-            if (!isalpha(word[i]))
-                word.erase(word.begin() + i);
-            else
-            {
-                word[i] = tolower(word[i]); 
-                i++;
+    int position = chunk.Start;
+    while (position < chunk.End && fin >> word) {
+        // Clean and normalize the word
+        word.erase(remove_if(word.begin(), word.end(), [](char c) { return !isalpha(c); }), word.end());
+        transform(word.begin(), word.end(), word.begin(), ::tolower);
+
+        // Update the index
+        if (!word.empty()) {
+            if (find(partialIndex[word].begin(), partialIndex[word].end(), chunk.FileID) == partialIndex[word].end()) {
+                partialIndex[word].push_back(chunk.FileID); // Record the file ID
             }
+        }
 
-        threadMap[word] = input->MapID;
+        position = fin.tellg();
+        if (position == -1) break; // EOF reached
     }
 }
 
-void Reduce(const ThreadMemory& input)
-{
-    // TODO    
-}
+// Worker thread function
+void* WorkerThread(void* args) {
+    ThreadMemory* threadMemory = (ThreadMemory*)args;
 
-void* WorkerThread(void* args)
-{
-    ThreadMemory* input = (ThreadMemory*)args;
-    
-    Map(input->File, input);
+    // Mapping phase
+    while (true) {
+        chunkMutex.lock();
+        if (chunkQueue.empty()) {
+            chunkMutex.unlock();
+            break; // No more chunks
+        }
+        Chunk chunk = chunkQueue.front();
+        chunkQueue.pop();
+        chunkMutex.unlock();
 
-    // Wait for all of the mappers to finish
-    pthread_barrier_wait(&input->MapperBarrier);
+        Map(chunk, (*threadMemory->PartialIndexes)[threadMemory->ThreadID]);
+    }
 
+    pthread_barrier_wait(threadMemory->MapperBarrier);
+
+    // TODO: Implement dynamic Reduce phase
     return NULL;
 }
 
-void printThreadBuckets(const vector<ThreadBucket>& threadBuckets)
-{
-    for (int i = 0; i < threadBuckets.size(); i++)
-    {
-        cout << "Thread " << i << ":\n";
-        for (const string& file : threadBuckets[i].Files)
-        {
-            cout << file << endl;
+// Reduces partial indexes into a final index
+void Reduce(vector<map<string, vector<int>>>& partialIndexes, map<string, vector<int>>& finalIndex) {
+    for (const auto& partialIndex : partialIndexes) {
+        for (const auto& [word, fileIDs] : partialIndex) {
+            vector<int>& finalFileIDs = finalIndex[word];
+            for (int fileID : fileIDs) {
+                if (find(finalFileIDs.begin(), finalFileIDs.end(), fileID) == finalFileIDs.end()) {
+                    finalFileIDs.push_back(fileID); // Merge unique file IDs
+                }
+            }
         }
-        cout << "Total size: " << threadBuckets[i].TotalSize << endl;
-        cout << endl;
-    }
-}
-void printInverseIndexes(const vector<ThreadMemory>& inverseIndexThreads)
-{
-    for (const auto& threadResult : inverseIndexThreads)
-    {
-        cout << "Thread " << threadResult.File << endl;
-        for (const auto& [key, value] : threadResult.InverseIndex)
-            cout << key << " " << value << endl;
-        cout << endl;
     }
 }
 
-int main(int argc, char **argv)
-{
-    if (argc != 4)
-    {
+int main(int argc, char** argv) {
+    if (argc != 4) {
         cerr << "Usage: " << argv[0] << " <no_mapper_threads> <no_reducer_threads> <input_file>" << endl;
         return 1;
     }
@@ -177,45 +141,46 @@ int main(int argc, char **argv)
     int reducerThreadsCount = stoi(argv[2]);
     string inputFile = argv[3];
 
+    // Read the file metadata
     vector<FileBucket> fileBuckets = ReadDatasetNames(inputFile);
 
-    vector<ThreadBucket> threadBuckets(mapperThreadsCount);
-    AssignFilesToThreads(fileBuckets, mapperThreadsCount, threadBuckets);
+    // Add chunks to the global queue
+    const int chunkSize = 1024; // Define a chunk size
+    AddChunksToQueue(fileBuckets, chunkSize);
 
-    int noThreads = fileBuckets.size();
-    vector<pthread_t> threads(noThreads);
-    vector<InverseIndexMap> inverseIndexMaps(noThreads);
-    vector<ThreadMemory> inverseIndexThreads(noThreads);
+    // Initialize partial indexes for threads
+    vector<map<string, vector<int>>> partialIndexes(mapperThreadsCount);
+
+    // Create and initialize mapper threads
     pthread_barrier_t barrier;
-    pthread_barrier_init(&barrier, NULL, mapperThreadsCount);
+    pthread_barrier_init(&barrier, nullptr, mapperThreadsCount);
 
-    int threadID = 0;
-    for (const ThreadBucket& tb : threadBuckets)
-    {
-        for (const string& file : tb.Files)
-        {
-            inverseIndexThreads[threadID].File = file;
-            inverseIndexThreads[threadID].MapID = threadID; // Each thread has their own unique fileX
-            inverseIndexThreads[threadID].MapID = threadID; // Each thread has their own unique fileX
-            inverseIndexThreads[threadID].MapperBarrier = barrier;
-            pthread_create(&threads[threadID], NULL, WorkerThread, (void*)&inverseIndexThreads[threadID]);
-            threadID++;
-        }
+    vector<pthread_t> threads(mapperThreadsCount);
+    vector<ThreadMemory> threadMemories(mapperThreadsCount);
+
+    for (int i = 0; i < mapperThreadsCount; i++) {
+        threadMemories[i] = {i, &partialIndexes, &barrier};
+        pthread_create(&threads[i], nullptr, WorkerThread, (void*)&threadMemories[i]);
     }
 
-    for (int i = 0; i < threads.size(); i++)
-    {
-        void* status;
-        int r = pthread_join(threads[i], &status);
- 
-        if (r) {
-            printf("Eroare la asteptarea thread-ului %d\n", i);
-            exit(-1);
-        }
+    // Wait for threads to complete
+    for (auto& thread : threads) {
+        pthread_join(thread, nullptr);
     }
 
-    // print inverse indexes
-    printInverseIndexes(inverseIndexThreads);
-    
+    // Reduce phase
+    map<string, vector<int>> finalIndex;
+    Reduce(partialIndexes, finalIndex);
+
+    // Print final index
+    for (const auto& [word, fileIDs] : finalIndex) {
+        cout << word << ": ";
+        for (int fileID : fileIDs) {
+            cout << fileID << " ";
+        }
+        cout << endl;
+    }
+
+    pthread_barrier_destroy(&barrier);
     return 0;
 }
