@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 #include <queue>
-#include <mutex>
 #include <cctype>
 #include <algorithm>
 
@@ -33,7 +32,7 @@ struct MapperThreadMemory {
     vector<map<string, vector<int>>>* PartialIndexes;
     pthread_barrier_t* MapperReducerBarrier;
     queue<Chunk>* ChunkQueue;
-    mutex* ChunkMutex;
+    pthread_mutex_t* ChunkMutex;
 };
 
 // Thread memory for reducing phase
@@ -44,7 +43,7 @@ struct ReducerThreadMemory {
     vector<map<string, vector<int>>>* PartialIndexes;
     pthread_barrier_t* MapperReducerBarrier;
     queue<map<string, vector<int>>>* ReduceQueue;
-    mutex* ReduceMutex;
+    pthread_mutex_t* ReduceMutex;
 };
 
 // Adds file chunks to the queue for processing
@@ -101,14 +100,14 @@ void* MapThread(void* args) {
     MapperThreadMemory* threadMemory = (MapperThreadMemory*)args;
 
     while (true) {
-        threadMemory->ChunkMutex->lock();
+        pthread_mutex_lock(threadMemory->ChunkMutex);
         if (threadMemory->ChunkQueue->empty()) {
-            threadMemory->ChunkMutex->unlock();
+            pthread_mutex_unlock(threadMemory->ChunkMutex);
             break; // No more chunks
         }
         Chunk chunk = threadMemory->ChunkQueue->front();
         threadMemory->ChunkQueue->pop();
-        threadMemory->ChunkMutex->unlock();
+        pthread_mutex_unlock(threadMemory->ChunkMutex);
 
         // Map the chunk
         Map(chunk, (*threadMemory->PartialIndexes)[threadMemory->ThreadID]);
@@ -126,9 +125,9 @@ void* ReduceThread(void* args) {
     while (true) {
         map<string, vector<int>> map1, map2;
 
-        threadMemory->ReduceMutex->lock();
+        pthread_mutex_lock(threadMemory->ReduceMutex);
         if (threadMemory->ReduceQueue->size() < 2) {
-            threadMemory->ReduceMutex->unlock();
+            pthread_mutex_unlock(threadMemory->ReduceMutex);
             break; // Not enough maps to process
         }
 
@@ -137,15 +136,15 @@ void* ReduceThread(void* args) {
         threadMemory->ReduceQueue->pop();
         map2 = move(threadMemory->ReduceQueue->front());
         threadMemory->ReduceQueue->pop();
-        threadMemory->ReduceMutex->unlock();
+        pthread_mutex_unlock(threadMemory->ReduceMutex);
 
         // Combine the maps
         CombineMaps(map1, map2);
 
         // Push the combined map back into the queue
-        threadMemory->ReduceMutex->lock();
+        pthread_mutex_lock(threadMemory->ReduceMutex);
         threadMemory->ReduceQueue->push(move(map1));
-        threadMemory->ReduceMutex->unlock();
+        pthread_mutex_unlock(threadMemory->ReduceMutex);
     }
 
     return NULL;
@@ -179,7 +178,7 @@ int main(int argc, char** argv) {
 
     // Create a queue for file chunks
     queue<Chunk> chunkQueue;
-    const int chunkSize = 1024; // Define a chunk size
+    int chunkSize = 1024; // Define a chunk size
     AddChunksToQueue(fileBuckets, chunkSize, chunkQueue);
 
     // Initialize partial indexes for threads
@@ -192,27 +191,23 @@ int main(int argc, char** argv) {
     // Create a queue for reducing phase
     queue<map<string, vector<int>>> reduceQueue;
 
-    // Create mutexes for chunk and reduce queue synchronization
-    mutex chunkMutex;
-    mutex reduceMutex;
+    // Initialize mutexes
+    pthread_mutex_t chunkMutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t reduceMutex = PTHREAD_MUTEX_INITIALIZER;
 
     // Create all threads (both mapping and reducing)
     vector<pthread_t> threads(mapperThreadsCount + reducerThreadsCount);
     vector<MapperThreadMemory> mapperMemories(mapperThreadsCount);
     vector<ReducerThreadMemory> reducerMemories(reducerThreadsCount);
 
-    // Create mapper threads
     for (int i = 0; i < mapperThreadsCount + reducerThreadsCount; i++) {
-        if (i < mapperThreadsCount)
-        {
+        if (i < mapperThreadsCount) {
             mapperMemories[i] = {i, mapperThreadsCount, &fileBuckets, &partialIndexes, &barrier, &chunkQueue, &chunkMutex};
             pthread_create(&threads[i], nullptr, MapThread, (void*)&mapperMemories[i]);
-        }
-        else
-        {
+        } else {
             int idx = i - mapperThreadsCount;
             reducerMemories[idx] = {idx + mapperThreadsCount, mapperThreadsCount, reducerThreadsCount, &partialIndexes, &barrier, &reduceQueue, &reduceMutex};
-            pthread_create(&threads[mapperThreadsCount + idx], nullptr, ReduceThread, (void*)&reducerMemories[idx]);
+            pthread_create(&threads[i], nullptr, ReduceThread, (void*)&reducerMemories[idx]);
         }
     }
 
@@ -239,5 +234,7 @@ int main(int argc, char** argv) {
     }
 
     pthread_barrier_destroy(&barrier);
+    pthread_mutex_destroy(&chunkMutex);
+    pthread_mutex_destroy(&reduceMutex);
     return 0;
 }

@@ -238,3 +238,4 @@ int main(int argc, char** argv) {
     pthread_barrier_destroy(&barrier);
     return 0;
 }
+basa
