@@ -1,9 +1,10 @@
 #include <iostream>
 #include <fstream>
-#include <unordered_map>
+#include <map>
 #include <pthread.h>
 #include <string>
 #include <vector>
+#include <cctype>
 #include <algorithm>
 
 using namespace std;
@@ -41,6 +42,20 @@ struct ThreadBucket
 {
     vector<string> Files;
     int TotalSize = 0;
+};
+
+typedef map<string, int> InverseIndexMap;
+
+struct ThreadMemory
+{
+    ThreadMemory(string file, int mapID, int reduceIDStart, int reduceIDStop, vector<InverseIndexMap>& inverseIndexes, pthread_barrier_t& mapperBarrier)
+        : File(file), MapID(mapID), ReduceIDStart(reduceIDStart), ReduceIDStop(reduceIDStop), InverseIndexes(inverseIndexes), MapperBarrier(mapperBarrier) {}
+    string File;
+    int MapID;
+    int ReduceIDStart, ReduceIDStop;
+
+    vector<InverseIndexMap>& InverseIndexes;
+    pthread_barrier_t& MapperBarrier;
 };
 
 void AssignFilesToThreads(const vector<FileBucket>& fileBuckets, int mapperThreadsCount, vector<ThreadBucket>& threadBuckets)
@@ -86,6 +101,70 @@ void AssignFilesToThreads(const vector<FileBucket>& fileBuckets, int mapperThrea
     }
 }
 
+void Map(const string& file, ThreadMemory* input)
+{
+    ifstream fin(input->File);
+    InverseIndexMap& threadMap = (*input->InverseIndexes)[input->MapID];
+
+    while (!fin.eof())
+    {
+        string word;
+        fin >> word;
+        // Erase everything which isn't alphabet letters
+        for (int i = 0; i < word.size();)
+            if (!isalpha(word[i]))
+                word.erase(word.begin() + i);
+            else
+            {
+                word[i] = tolower(word[i]); 
+                i++;
+            }
+
+        threadMap[word] = input->MapID;
+    }
+}
+
+void Reduce(const ThreadMemory& input)
+{
+    // TODO    
+}
+
+void* WorkerThread(void* args)
+{
+    ThreadMemory* input = (ThreadMemory*)args;
+    
+    Map(input->File, input);
+
+    // Wait for all of the mappers to finish
+    pthread_barrier_wait(&input->MapperBarrier);
+
+    return NULL;
+}
+
+void printThreadBuckets(const vector<ThreadBucket>& threadBuckets)
+{
+    for (int i = 0; i < threadBuckets.size(); i++)
+    {
+        cout << "Thread " << i << ":\n";
+        for (const string& file : threadBuckets[i].Files)
+        {
+            cout << file << endl;
+        }
+        cout << "Total size: " << threadBuckets[i].TotalSize << endl;
+        cout << endl;
+    }
+}
+void printInverseIndexes(const vector<ThreadMemory>& inverseIndexThreads)
+{
+    for (const auto& threadResult : inverseIndexThreads)
+    {
+        cout << "Thread " << threadResult.File << endl;
+        for (const auto& [key, value] : threadResult.InverseIndex)
+            cout << key << " " << value << endl;
+        cout << endl;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 4)
@@ -103,16 +182,40 @@ int main(int argc, char **argv)
     vector<ThreadBucket> threadBuckets(mapperThreadsCount);
     AssignFilesToThreads(fileBuckets, mapperThreadsCount, threadBuckets);
 
-    // print the thread buckets with their files
-    for (int i = 0; i < mapperThreadsCount; i++)
+    int noThreads = fileBuckets.size();
+    vector<pthread_t> threads(noThreads);
+    vector<InverseIndexMap> inverseIndexMaps(noThreads);
+    vector<ThreadMemory> inverseIndexThreads(noThreads);
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, mapperThreadsCount);
+
+    int threadID = 0;
+    for (const ThreadBucket& tb : threadBuckets)
     {
-        cout << "Thread " << i << ":\n";
-        for (const string& file : threadBuckets[i].Files)
+        for (const string& file : tb.Files)
         {
-            cout << file << endl;
+            inverseIndexThreads[threadID].File = file;
+            inverseIndexThreads[threadID].MapID = threadID; // Each thread has their own unique fileX
+            inverseIndexThreads[threadID].MapID = threadID; // Each thread has their own unique fileX
+            inverseIndexThreads[threadID].MapperBarrier = barrier;
+            pthread_create(&threads[threadID], NULL, WorkerThread, (void*)&inverseIndexThreads[threadID]);
+            threadID++;
         }
-        cout << "Total size: " << threadBuckets[i].TotalSize << endl;
-        cout << endl;
     }
+
+    for (int i = 0; i < threads.size(); i++)
+    {
+        void* status;
+        int r = pthread_join(threads[i], &status);
+ 
+        if (r) {
+            printf("Eroare la asteptarea thread-ului %d\n", i);
+            exit(-1);
+        }
+    }
+
+    // print inverse indexes
+    printInverseIndexes(inverseIndexThreads);
+    
     return 0;
 }
