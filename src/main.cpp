@@ -20,44 +20,27 @@ struct FileBucket {
 // Represents a chunk of a file (portion to be processed)
 struct Chunk {
     string File;
-    int Start; // Start byte
-    int End;   // End byte
+    int Start;  // Start byte
+    int End;    // End byte
     int FileID; // Unique ID for the file
 };
 
-// Global queue of chunks and mutex for synchronization
-queue<Chunk> chunkQueue;
-mutex chunkMutex;
-
-// Reads dataset file names and sizes from the input file
-vector<FileBucket> ReadDatasetNames(const string& inputPath) {
-    ifstream fin(inputPath);
-    vector<FileBucket> datasetNames;
-
-    int n;
-    fin >> n;
-    for (int i = 0; i < n; i++) {
-        string datasetName;
-        fin >> datasetName;
-
-        // Get file size
-        ifstream fileStream(datasetName, ios::binary | ios::ate);
-        int fileSize = fileStream.tellg();
-
-        datasetNames.push_back({datasetName, fileSize});
-    }
-    return datasetNames;
-}
-
-// Thread memory for mapping phase
+// Thread memory for mapping and reducing phase
 struct ThreadMemory {
     int ThreadID;
-    vector<map<string, vector<int>>>* PartialIndexes; // Updated for file IDs
-    pthread_barrier_t* MapperBarrier;
+    int MapperThreadsCount;
+    int ReducerThreadsCount;
+    vector<FileBucket>* FileBuckets;
+    vector<map<string, vector<int>>>* PartialIndexes;
+    pthread_barrier_t* MapperReducerBarrier;
+    queue<Chunk>* ChunkQueue;
+    queue<map<string, vector<int>>>* ReduceQueue;
+    mutex* ChunkMutex;
+    mutex* ReduceMutex;
 };
 
-// Adds file chunks to the global queue for processing
-void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize) {
+// Adds file chunks to the queue for processing
+void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queue<Chunk>& chunkQueue) {
     for (int fileID = 0; fileID < fileBuckets.size(); fileID++) {
         const auto& file = fileBuckets[fileID];
         int start = 0;
@@ -93,42 +76,71 @@ void Map(Chunk chunk, map<string, vector<int>>& partialIndex) {
     }
 }
 
-// Worker thread function
-void* WorkerThread(void* args) {
-    ThreadMemory* threadMemory = (ThreadMemory*)args;
-
-    // Mapping phase
-    while (true) {
-        chunkMutex.lock();
-        if (chunkQueue.empty()) {
-            chunkMutex.unlock();
-            break; // No more chunks
-        }
-        Chunk chunk = chunkQueue.front();
-        chunkQueue.pop();
-        chunkMutex.unlock();
-
-        Map(chunk, (*threadMemory->PartialIndexes)[threadMemory->ThreadID]);
-    }
-
-    pthread_barrier_wait(threadMemory->MapperBarrier);
-
-    // TODO: Implement dynamic Reduce phase
-    return NULL;
-}
-
-// Reduces partial indexes into a final index
-void Reduce(vector<map<string, vector<int>>>& partialIndexes, map<string, vector<int>>& finalIndex) {
-    for (const auto& partialIndex : partialIndexes) {
-        for (const auto& [word, fileIDs] : partialIndex) {
-            vector<int>& finalFileIDs = finalIndex[word];
-            for (int fileID : fileIDs) {
-                if (find(finalFileIDs.begin(), finalFileIDs.end(), fileID) == finalFileIDs.end()) {
-                    finalFileIDs.push_back(fileID); // Merge unique file IDs
-                }
+// Combines two maps
+void CombineMaps(map<string, vector<int>>& map1, const map<string, vector<int>>& map2) {
+    for (const auto& [word, fileIDs] : map2) {
+        vector<int>& combinedFileIDs = map1[word];
+        for (int fileID : fileIDs) {
+            if (find(combinedFileIDs.begin(), combinedFileIDs.end(), fileID) == combinedFileIDs.end()) {
+                combinedFileIDs.push_back(fileID);
             }
         }
     }
+}
+
+// Worker thread function for both mapping and reducing
+void* WorkerThread(void* args) {
+    ThreadMemory* threadMemory = (ThreadMemory*)args;
+
+    // Mapping phase (if thread ID is less than mapper thread count)
+    if (threadMemory->ThreadID < threadMemory->MapperThreadsCount) {
+        while (true) {
+            threadMemory->ChunkMutex->lock();
+            if (threadMemory->ChunkQueue->empty()) {
+                threadMemory->ChunkMutex->unlock();
+                break; // No more chunks
+            }
+            Chunk chunk = threadMemory->ChunkQueue->front();
+            threadMemory->ChunkQueue->pop();
+            threadMemory->ChunkMutex->unlock();
+
+            // Map the chunk
+            Map(chunk, (*threadMemory->PartialIndexes)[threadMemory->ThreadID]);
+        }
+
+        // Barrier to synchronize threads after mapping phase
+        pthread_barrier_wait(threadMemory->MapperReducerBarrier);
+    }
+
+    // Reducing phase (if thread ID is >= mapper thread count)
+    if (threadMemory->ThreadID >= threadMemory->MapperThreadsCount) {
+        while (true) {
+            map<string, vector<int>> map1, map2;
+
+            threadMemory->ReduceMutex->lock();
+            if (threadMemory->ReduceQueue->size() < 2) {
+                threadMemory->ReduceMutex->unlock();
+                break; // Not enough maps to process
+            }
+
+            // Get two maps from the queue
+            map1 = move(threadMemory->ReduceQueue->front());
+            threadMemory->ReduceQueue->pop();
+            map2 = move(threadMemory->ReduceQueue->front());
+            threadMemory->ReduceQueue->pop();
+            threadMemory->ReduceMutex->unlock();
+
+            // Combine the maps
+            CombineMaps(map1, map2);
+
+            // Push the combined map back into the queue
+            threadMemory->ReduceMutex->lock();
+            threadMemory->ReduceQueue->push(move(map1));
+            threadMemory->ReduceMutex->unlock();
+        }
+    }
+
+    return NULL;
 }
 
 int main(int argc, char** argv) {
@@ -142,24 +154,46 @@ int main(int argc, char** argv) {
     string inputFile = argv[3];
 
     // Read the file metadata
-    vector<FileBucket> fileBuckets = ReadDatasetNames(inputFile);
+    ifstream fin(inputFile);
+    vector<FileBucket> fileBuckets;
+    int n;
+    fin >> n;
+    for (int i = 0; i < n; i++) {
+        string datasetName;
+        fin >> datasetName;
 
-    // Add chunks to the global queue
+        // Get file size
+        ifstream fileStream(datasetName, ios::binary | ios::ate);
+        int fileSize = fileStream.tellg();
+
+        fileBuckets.push_back({datasetName, fileSize});
+    }
+
+    // Create a queue for file chunks
+    queue<Chunk> chunkQueue;
     const int chunkSize = 1024; // Define a chunk size
-    AddChunksToQueue(fileBuckets, chunkSize);
+    AddChunksToQueue(fileBuckets, chunkSize, chunkQueue);
 
     // Initialize partial indexes for threads
     vector<map<string, vector<int>>> partialIndexes(mapperThreadsCount);
 
-    // Create and initialize mapper threads
+    // Create and initialize barrier for synchronizing mapping and reducing phases
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, nullptr, mapperThreadsCount);
 
-    vector<pthread_t> threads(mapperThreadsCount);
-    vector<ThreadMemory> threadMemories(mapperThreadsCount);
+    // Create a queue for reducing phase
+    queue<map<string, vector<int>>> reduceQueue;
 
-    for (int i = 0; i < mapperThreadsCount; i++) {
-        threadMemories[i] = {i, &partialIndexes, &barrier};
+    // Create mutexes for chunk and reduce queue synchronization
+    mutex chunkMutex;
+    mutex reduceMutex;
+
+    // Create all threads (both mapping and reducing)
+    vector<pthread_t> threads(mapperThreadsCount + reducerThreadsCount);
+    vector<ThreadMemory> threadMemories(mapperThreadsCount + reducerThreadsCount);
+
+    for (int i = 0; i < mapperThreadsCount + reducerThreadsCount; i++) {
+        threadMemories[i] = {i, mapperThreadsCount, reducerThreadsCount, &fileBuckets, &partialIndexes, &barrier, &chunkQueue, &reduceQueue, &chunkMutex, &reduceMutex};
         pthread_create(&threads[i], nullptr, WorkerThread, (void*)&threadMemories[i]);
     }
 
@@ -168,9 +202,13 @@ int main(int argc, char** argv) {
         pthread_join(thread, nullptr);
     }
 
-    // Reduce phase
-    map<string, vector<int>> finalIndex;
-    Reduce(partialIndexes, finalIndex);
+    // Add partial indexes to the reduction queue
+    for (auto& partialIndex : partialIndexes) {
+        reduceQueue.push(move(partialIndex));
+    }
+
+    // Final index (after reduce phase)
+    map<string, vector<int>> finalIndex = move(reduceQueue.front());
 
     // Print final index
     for (const auto& [word, fileIDs] : finalIndex) {
