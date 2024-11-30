@@ -202,15 +202,18 @@ int main(int argc, char** argv) {
     vector<ReducerThreadMemory> reducerMemories(reducerThreadsCount);
 
     // Create mapper threads
-    for (int i = 0; i < mapperThreadsCount; i++) {
-        mapperMemories[i] = {i, mapperThreadsCount, &fileBuckets, &partialIndexes, &barrier, &chunkQueue, &chunkMutex};
-        pthread_create(&threads[i], nullptr, MapThread, (void*)&mapperMemories[i]);
-    }
-
-    // Create reducer threads
-    for (int i = 0; i < reducerThreadsCount; i++) {
-        reducerMemories[i] = {i + mapperThreadsCount, mapperThreadsCount, reducerThreadsCount, &partialIndexes, &barrier, &reduceQueue, &reduceMutex};
-        pthread_create(&threads[mapperThreadsCount + i], nullptr, ReduceThread, (void*)&reducerMemories[i]);
+    for (int i = 0; i < mapperThreadsCount + reducerThreadsCount; i++) {
+        if (i < mapperThreadsCount)
+        {
+            mapperMemories[i] = {i, mapperThreadsCount, &fileBuckets, &partialIndexes, &barrier, &chunkQueue, &chunkMutex};
+            pthread_create(&threads[i], nullptr, MapThread, (void*)&mapperMemories[i]);
+        }
+        else
+        {
+            int idx = i - mapperThreadsCount;
+            reducerMemories[idx] = {idx + mapperThreadsCount, mapperThreadsCount, reducerThreadsCount, &partialIndexes, &barrier, &reduceQueue, &reduceMutex};
+            pthread_create(&threads[mapperThreadsCount + idx], nullptr, ReduceThread, (void*)&reducerMemories[idx]);
+        }
     }
 
     // Wait for threads to complete
