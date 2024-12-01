@@ -266,7 +266,7 @@ void WriteIndexToFiles(const ReverseIndex& finalIndex)
         string fileName(1, startingLetter);
         fileName += ".txt";
 
-        // sort the file IDs
+        // sort the file IDs in ascending order
         auto sortedFileIDs = fileIDs;
         sort(sortedFileIDs.begin(), sortedFileIDs.end());
 
@@ -322,20 +322,20 @@ int main(int argc, char** argv)
     }
 
     // Create a queue for file chunks
+    // The chunk size is static
     queue<Chunk> chunkQueue;
-    int chunkSize = 15000; // Define a chunk size (cannot be smaller than the biggest word in any file)
+    int chunkSize = 15000;
     AddChunksToQueue(fileBuckets, chunkSize, chunkQueue);
 
     // Initialize partial indexes for threads
     vector<ReverseIndex> partialIndexes(mapperThreadsCount);
 
-    // Create and initialize barrier for synchronizing mapping and reducing phases
-    pthread_barrier_t barrier;
-    pthread_barrier_init(&barrier, nullptr, mapperThreadsCount + reducerThreadsCount);
-
     // Create a queue for reducing phase
     queue<ReverseIndex> reduceQueue;
 
+    // Create and initialize barrier for synchronizing mapping and reducing phases
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, nullptr, mapperThreadsCount + reducerThreadsCount);
     // Initialize mutexes
     pthread_mutex_t chunkMutex;
     pthread_mutex_t reduceMutex;
