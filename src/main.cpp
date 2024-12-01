@@ -11,13 +11,15 @@
 using namespace std;
 
 // Represents metadata about a file (name and size)
-struct FileBucket {
+struct FileBucket
+{
     string File;
     int Size;
 };
 
 // Represents a chunk of a file (portion to be processed)
-struct Chunk {
+struct Chunk
+{
     string File;
     int Start;  // Start byte
     int End;    // End byte
@@ -25,48 +27,55 @@ struct Chunk {
 };
 
 // Thread memory for mapping phase
-struct MapperThreadMemory {
+struct MapperThreadMemory
+{
     int ThreadID;
     int MapperThreadsCount;
     vector<FileBucket>* FileBuckets;
-    vector<map<string, vector<int>>>* PartialIndexes;
+    vector<unordered_map<string, vector<int>>>* PartialIndexes;
     pthread_barrier_t* MapperReducerBarrier;
     queue<Chunk>* ChunkQueue;
     pthread_mutex_t* ChunkMutex;
-    queue<map<string, vector<int>>>* ReduceQueue;
+    queue<unordered_map<string, vector<int>>>* ReduceQueue;
     pthread_mutex_t* ReduceMutex; // For safely pushing into the reduce queue
 };
 
 // Thread memory for reducing phase
-struct ReducerThreadMemory {
+struct ReducerThreadMemory
+{
     int ThreadID;
     int MapperThreadsCount;
     int ReducerThreadsCount;
-    vector<map<string, vector<int>>>* PartialIndexes;
+    vector<unordered_map<string, vector<int>>>* PartialIndexes;
     pthread_barrier_t* MapperReducerBarrier;
-    queue<map<string, vector<int>>>* ReduceQueue;
+    queue<unordered_map<string, vector<int>>>* ReduceQueue;
     pthread_mutex_t* ReduceMutex;
 };
 
 // Adds file chunks to the queue for processing
-void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queue<Chunk>& chunkQueue) {
-    for (int fileID = 0; fileID < fileBuckets.size(); fileID++) {
+void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queue<Chunk>& chunkQueue)
+{
+    for (int fileID = 0; fileID < fileBuckets.size(); fileID++)
+    {
         const auto& file = fileBuckets[fileID];
         ifstream fin(file.File);
 
-        if (!fin.is_open()) {
+        if (!fin.is_open())
+        {
             cerr << "Error opening file: " << file.File << endl;
             continue;
         }
 
         int start = 0;
-        while (start < file.Size) {
+        while (start < file.Size)
+        {
             int end = min(start + chunkSize, file.Size);
             fin.seekg(end);
 
             // Move 'end' to the next space or newline to avoid splitting words
             char c;
-            while (end < file.Size && fin.get(c) && !isspace(c)) {
+            while (end < file.Size && fin.get(c) && !isspace(c))
+            {
                 end++;
             }
 
@@ -77,49 +86,68 @@ void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queu
     }
 }
 
-// Maps a chunk to an inverse index
-void Map(Chunk chunk, map<string, vector<int>>& partialIndex) {
+void Map(Chunk chunk, unordered_map<string, vector<int>>& partialIndex)
+{
     ifstream fin(chunk.File);
     fin.seekg(chunk.Start);
     string word;
 
     int position = chunk.Start;
-    while (position < chunk.End && fin >> word) {
-        // Clean and normalize the word
-        word.erase(remove_if(word.begin(), word.end(), [](char c) { return !isalpha(c); }), word.end());
-        transform(word.begin(), word.end(), word.begin(), ::tolower);
+    while (position < chunk.End && !fin.eof())
+    {
+        fin >> word;
+
+        // Make the word lowercase and keep only alpha characters
+        for (int i = 0; i < word.size(); )
+        {
+            if (!isalpha(word[i]))
+            {
+                word.erase(i, 1);
+            }
+            else
+            {
+                word[i] = tolower(word[i]);
+                i++;
+            }
+        }
 
         // Update the index
-        if (!word.empty()) {
-            if (find(partialIndex[word].begin(), partialIndex[word].end(), chunk.FileID) == partialIndex[word].end()) {
+        if (!word.empty())
+        {
+            if (find(partialIndex[word].begin(), partialIndex[word].end(), chunk.FileID) == partialIndex[word].end())
+            {
                 partialIndex[word].push_back(chunk.FileID); // Record the file ID
             }
         }
 
         position = fin.tellg();
-        if (position == -1) break; // EOF reached
     }
 }
 
-// Combines two maps
-void CombineMaps(map<string, vector<int>>& map1, const map<string, vector<int>>& map2) {
-    for (const auto& [word, fileIDs] : map2) {
+void CombineMaps(unordered_map<string, vector<int>>& map1, const unordered_map<string, vector<int>>& map2)
+{
+    for (const auto& [word, fileIDs] : map2)
+    {
         vector<int>& combinedFileIDs = map1[word];
-        for (int fileID : fileIDs) {
-            if (find(combinedFileIDs.begin(), combinedFileIDs.end(), fileID) == combinedFileIDs.end()) {
+        for (int fileID : fileIDs)
+        {
+            if (find(combinedFileIDs.begin(), combinedFileIDs.end(), fileID) == combinedFileIDs.end())
+            {
                 combinedFileIDs.push_back(fileID);
             }
         }
     }
 }
 
-// Mapper thread function
-void* MapThread(void* args) {
+void* MapThread(void* args)
+{
     MapperThreadMemory* threadMemory = (MapperThreadMemory*)args;
 
-    while (true) {
+    while (true)
+    {
         pthread_mutex_lock(threadMemory->ChunkMutex);
-        if (threadMemory->ChunkQueue->empty()) {
+        if (threadMemory->ChunkQueue->empty())
+        {
             pthread_mutex_unlock(threadMemory->ChunkMutex);
             break; // No more chunks
         }
@@ -142,17 +170,20 @@ void* MapThread(void* args) {
 }
 
 // Reducer thread function
-void* ReduceThread(void* args) {
+void* ReduceThread(void* args)
+{
     ReducerThreadMemory* threadMemory = (ReducerThreadMemory*)args;
 
     // Wait until mappers are done
     pthread_barrier_wait(threadMemory->MapperReducerBarrier);
 
-    while (true) {
-        map<string, vector<int>> map1, map2;
+    while (true)
+    {
+        unordered_map<string, vector<int>> map1, map2;
 
         pthread_mutex_lock(threadMemory->ReduceMutex);
-        if (threadMemory->ReduceQueue->size() < 2) {
+        if (threadMemory->ReduceQueue->size() < 2)
+        {
             pthread_mutex_unlock(threadMemory->ReduceMutex);
             break; // Not enough maps to process
         }
@@ -164,36 +195,9 @@ void* ReduceThread(void* args) {
         threadMemory->ReduceQueue->pop();
         pthread_mutex_unlock(threadMemory->ReduceMutex);
 
-        // Combine the maps
-        // print map1 and map2
-        // cout << "Map1: " << endl;
-        // for (const auto& [word, fileIDs] : map1) {
-        //     cout << word << ": ";
-        //     for (int fileID : fileIDs) {
-        //         cout << fileID << " ";
-        //     }
-        //     cout << endl;
-        // }
-        // cout << "Map2: " << endl;
-        // for (const auto& [word, fileIDs] : map2) {
-        //     cout << word << ": ";
-        //     for (int fileID : fileIDs) {
-        //         cout << fileID << " ";
-        //     }
-        //     cout << endl;
-        // }
         CombineMaps(map1, map2);
-        // combined into map1
-        // cout << "Combined Map: " << endl;
-        // for (const auto& [word, fileIDs] : map1) {
-        //     cout << word << ": ";
-        //     for (int fileID : fileIDs) {
-        //         cout << fileID << " ";
-        //     }
-        //     cout << endl;
-        // }
 
-        // Push the combined map back into the queue
+        // Push the combined unordered_map back into the queue
         pthread_mutex_lock(threadMemory->ReduceMutex);
         threadMemory->ReduceQueue->push(move(map1));
         pthread_mutex_unlock(threadMemory->ReduceMutex);
@@ -202,31 +206,39 @@ void* ReduceThread(void* args) {
     return NULL;
 }
 
-bool CompareByFileIDCount(const pair<string, vector<int>>& a, const pair<string, vector<int>>& b) {
-    if (a.second.size() == b.second.size()) {
+bool CompareByFileIDCount(const pair<string, vector<int>>& a, const pair<string, vector<int>>& b)
+{
+    if (a.second.size() == b.second.size())
+    {
         return a.first < b.first;  // Compare based on word in ascending order
     }
     return a.second.size() > b.second.size();  // Compare based on size of vector<int> in descending order
 }
 
-void WriteIndexToFiles(const map<string, vector<int>>& finalIndex) {
+void WriteIndexToFiles(const unordered_map<string, vector<int>>& finalIndex)
+{
     unordered_map<char, ofstream> fileStreams;
     // open all files in out mode
-    for (int c = 'a'; c <= 'z'; c++) {
+    for (int c = 'a'; c <= 'z'; c++)
+    {
         string fileName(1, c);
         fileName += ".txt";
         fileStreams[c].open(fileName);
     }
 
-    // Collect the entries from the finalIndex map into a vector of pairs
+    // Collect the entries from the finalIndex unordered_map into a vector of pairs
     vector<pair<string, vector<int>>> sortedIndex(finalIndex.begin(), finalIndex.end());
 
     // Sort the vector based on the size of the fileID list in descending order
     sort(sortedIndex.begin(), sortedIndex.end(), CompareByFileIDCount);
 
     // Write the sorted entries to the output files
-    for (const auto& [word, fileIDs] : sortedIndex) {
-        if (word.empty()) continue;
+    for (const auto& [word, fileIDs] : sortedIndex)
+    {
+        if (word.empty())
+        {
+            continue;
+        }
 
         // Determine the file name based on the starting letter
         char startingLetter = tolower(word[0]);
@@ -241,9 +253,11 @@ void WriteIndexToFiles(const map<string, vector<int>>& finalIndex) {
         outFile << word << ":[";
 
         // Write the sorted file IDs
-        for (size_t i = 0; i < sortedFileIDs.size(); i++) {
+        for (size_t i = 0; i < sortedFileIDs.size(); i++)
+        {
             outFile << sortedFileIDs[i];
-            if (i < sortedFileIDs.size() - 1) {
+            if (i < sortedFileIDs.size() - 1)
+            {
                 outFile << " ";
             }
         }
@@ -251,13 +265,16 @@ void WriteIndexToFiles(const map<string, vector<int>>& finalIndex) {
     }
 
     // Close all file streams
-    for (auto& [_, stream] : fileStreams) {
+    for (auto& [_, stream] : fileStreams)
+    {
         stream.close();
     }
 }
 
-int main(int argc, char** argv) {
-    if (argc != 4) {
+int main(int argc, char** argv)
+{
+    if (argc != 4)
+    {
         cerr << "Usage: " << argv[0] << " <no_mapper_threads> <no_reducer_threads> <input_file>" << endl;
         return 1;
     }
@@ -271,7 +288,8 @@ int main(int argc, char** argv) {
     vector<FileBucket> fileBuckets;
     int n;
     fin >> n;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
+    {
         string datasetName;
         fin >> datasetName;
 
@@ -288,14 +306,14 @@ int main(int argc, char** argv) {
     AddChunksToQueue(fileBuckets, chunkSize, chunkQueue);
 
     // Initialize partial indexes for threads
-    vector<map<string, vector<int>>> partialIndexes(mapperThreadsCount);
+    vector<unordered_map<string, vector<int>>> partialIndexes(mapperThreadsCount);
 
     // Create and initialize barrier for synchronizing mapping and reducing phases
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, nullptr, mapperThreadsCount + reducerThreadsCount);
 
     // Create a queue for reducing phase
-    queue<map<string, vector<int>>> reduceQueue;
+    queue<unordered_map<string, vector<int>>> reduceQueue;
 
     // Initialize mutexes
     pthread_mutex_t chunkMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -306,13 +324,17 @@ int main(int argc, char** argv) {
     vector<MapperThreadMemory> mapperMemories(mapperThreadsCount);
     vector<ReducerThreadMemory> reducerMemories(reducerThreadsCount);
 
-    for (int i = 0; i < mapperThreadsCount + reducerThreadsCount; i++) {
-        if (i < mapperThreadsCount) {
+    for (int i = 0; i < mapperThreadsCount + reducerThreadsCount; i++)
+    {
+        if (i < mapperThreadsCount)
+        {
             mapperMemories[i] = {
                 i, mapperThreadsCount, &fileBuckets, &partialIndexes, &barrier,
                 &chunkQueue, &chunkMutex, &reduceQueue, &reduceMutex};
             pthread_create(&threads[i], nullptr, MapThread, (void*)&mapperMemories[i]);
-        } else {
+        }
+        else
+        {
             int idx = i - mapperThreadsCount;
             reducerMemories[idx] = {
                 idx + mapperThreadsCount, mapperThreadsCount, reducerThreadsCount, 
@@ -322,12 +344,13 @@ int main(int argc, char** argv) {
     }
 
     // Wait for threads to complete
-    for (auto& thread : threads) {
+    for (auto& thread : threads)
+    {
         pthread_join(thread, nullptr);
     }
 
     // Final index (after reduce phase)
-    map<string, vector<int>> finalIndex = move(reduceQueue.front());
+    unordered_map<string, vector<int>> finalIndex = move(reduceQueue.front());
 
     WriteIndexToFiles(finalIndex);
 
