@@ -29,7 +29,6 @@ struct Chunk
     int FileID;
 };
 
-// Thread memory for mapping phase
 struct MapperThreadMemory
 {
     MapperThreadMemory(int threadID, int mapperThreadsCount, vector<FileBucket>& fileBuckets,
@@ -44,6 +43,7 @@ struct MapperThreadMemory
 
     int ThreadID;
     int MapperThreadsCount;
+    // Dependencies and outputs
     vector<FileBucket>& FileBuckets;
     vector<ReverseIndex>& PartialIndexes;
     queue<Chunk>& ChunkQueue;
@@ -53,7 +53,6 @@ struct MapperThreadMemory
     pthread_mutex_t& ReduceMutex;
 };
 
-// Thread memory for reducing phase
 struct ReducerThreadMemory
 {
     ReducerThreadMemory(int threadID, int reducerThreadsCount,
@@ -67,13 +66,13 @@ struct ReducerThreadMemory
 
     int ThreadID;
     int ReducerThreadsCount;
+    // Dependencies and outputs
     vector<ReverseIndex>& PartialIndexes;
     queue<ReverseIndex>& ReduceQueue;
     pthread_barrier_t& MapperReducerBarrier;
     pthread_mutex_t& ReduceMutex;
 };
 
-// Adds file chunks to the queue for processing
 void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queue<Chunk>& chunkQueue)
 {
     for (int fileID = 0; fileID < fileBuckets.size(); fileID++)
@@ -233,7 +232,7 @@ bool CompareByFileIDCount(const IndexEntry& a, const IndexEntry& b)
     // Compare first by the count of associated file IDs and then alphabetically
     if (a.second.size() == b.second.size())
         return a.first < b.first;  
-    return a.second.size() > b.second.size();  
+    return a.second.size() > b.second.size();
 }
 
 void WriteIndexToFiles(const ReverseIndex& finalIndex)
