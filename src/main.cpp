@@ -10,6 +10,8 @@
 
 using namespace std;
 
+typedef unordered_map<string, vector<int>> ReverseIndex;
+
 // Represents metadata about a file (name and size)
 struct FileBucket
 {
@@ -32,11 +34,11 @@ struct MapperThreadMemory
     int ThreadID;
     int MapperThreadsCount;
     vector<FileBucket>* FileBuckets;
-    vector<unordered_map<string, vector<int>>>* PartialIndexes;
+    vector<ReverseIndex>* PartialIndexes;
     pthread_barrier_t* MapperReducerBarrier;
     queue<Chunk>* ChunkQueue;
     pthread_mutex_t* ChunkMutex;
-    queue<unordered_map<string, vector<int>>>* ReduceQueue;
+    queue<ReverseIndex>* ReduceQueue;
     pthread_mutex_t* ReduceMutex; // For safely pushing into the reduce queue
 };
 
@@ -46,9 +48,9 @@ struct ReducerThreadMemory
     int ThreadID;
     int MapperThreadsCount;
     int ReducerThreadsCount;
-    vector<unordered_map<string, vector<int>>>* PartialIndexes;
+    vector<ReverseIndex>* PartialIndexes;
     pthread_barrier_t* MapperReducerBarrier;
-    queue<unordered_map<string, vector<int>>>* ReduceQueue;
+    queue<ReverseIndex>* ReduceQueue;
     pthread_mutex_t* ReduceMutex;
 };
 
@@ -86,7 +88,7 @@ void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queu
     }
 }
 
-void Map(Chunk chunk, unordered_map<string, vector<int>>& partialIndex)
+void Map(Chunk chunk, ReverseIndex& partialIndex)
 {
     ifstream fin(chunk.File);
     fin.seekg(chunk.Start);
@@ -124,7 +126,7 @@ void Map(Chunk chunk, unordered_map<string, vector<int>>& partialIndex)
     }
 }
 
-void CombineMaps(unordered_map<string, vector<int>>& map1, const unordered_map<string, vector<int>>& map2)
+void CombineMaps(ReverseIndex& map1, const ReverseIndex& map2)
 {
     for (const auto& [word, fileIDs] : map2)
     {
@@ -179,7 +181,7 @@ void* ReduceThread(void* args)
 
     while (true)
     {
-        unordered_map<string, vector<int>> map1, map2;
+        ReverseIndex map1, map2;
 
         pthread_mutex_lock(threadMemory->ReduceMutex);
         if (threadMemory->ReduceQueue->size() < 2)
@@ -215,7 +217,7 @@ bool CompareByFileIDCount(const pair<string, vector<int>>& a, const pair<string,
     return a.second.size() > b.second.size();  // Compare based on size of vector<int> in descending order
 }
 
-void WriteIndexToFiles(const unordered_map<string, vector<int>>& finalIndex)
+void WriteIndexToFiles(const ReverseIndex& finalIndex)
 {
     unordered_map<char, ofstream> fileStreams;
     // open all files in out mode
@@ -306,18 +308,20 @@ int main(int argc, char** argv)
     AddChunksToQueue(fileBuckets, chunkSize, chunkQueue);
 
     // Initialize partial indexes for threads
-    vector<unordered_map<string, vector<int>>> partialIndexes(mapperThreadsCount);
+    vector<ReverseIndex> partialIndexes(mapperThreadsCount);
 
     // Create and initialize barrier for synchronizing mapping and reducing phases
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, nullptr, mapperThreadsCount + reducerThreadsCount);
 
     // Create a queue for reducing phase
-    queue<unordered_map<string, vector<int>>> reduceQueue;
+    queue<ReverseIndex> reduceQueue;
 
     // Initialize mutexes
-    pthread_mutex_t chunkMutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_t reduceMutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t chunkMutex;
+    pthread_mutex_t reduceMutex;
+    pthread_mutex_init(&chunkMutex, nullptr);
+    pthread_mutex_init(&reduceMutex, nullptr);
 
     // Create all threads (both mapping and reducing)
     vector<pthread_t> threads(mapperThreadsCount + reducerThreadsCount);
@@ -350,7 +354,7 @@ int main(int argc, char** argv)
     }
 
     // Final index (after reduce phase)
-    unordered_map<string, vector<int>> finalIndex = move(reduceQueue.front());
+    ReverseIndex finalIndex = move(reduceQueue.front());
 
     WriteIndexToFiles(finalIndex);
 
