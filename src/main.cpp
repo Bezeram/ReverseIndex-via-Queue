@@ -24,9 +24,9 @@ struct FileBucket
 struct Chunk
 {
     string File;
-    int Start;  // Start byte
-    int End;    // End byte
-    int FileID; // Unique ID for the file
+    int Start; 
+    int End;   
+    int FileID;
 };
 
 // Thread memory for mapping phase
@@ -56,17 +56,16 @@ struct MapperThreadMemory
 // Thread memory for reducing phase
 struct ReducerThreadMemory
 {
-    ReducerThreadMemory(int threadID, int mapperThreadsCount, int reducerThreadsCount,
+    ReducerThreadMemory(int threadID, int reducerThreadsCount,
                         vector<ReverseIndex>& partialIndexes, pthread_barrier_t& mapperReducerBarrier,
                         queue<ReverseIndex>& reduceQueue, pthread_mutex_t& reduceMutex)
-        : ThreadID(threadID), MapperThreadsCount(mapperThreadsCount), ReducerThreadsCount(reducerThreadsCount),
+        : ThreadID(threadID), ReducerThreadsCount(reducerThreadsCount),
           PartialIndexes(partialIndexes), MapperReducerBarrier(mapperReducerBarrier),
           ReduceQueue(reduceQueue), ReduceMutex(reduceMutex)
     {
     }
 
     int ThreadID;
-    int MapperThreadsCount;
     int ReducerThreadsCount;
     vector<ReverseIndex>& PartialIndexes;
     queue<ReverseIndex>& ReduceQueue;
@@ -202,8 +201,6 @@ void* ReduceThread(void* args)
 
     while (true)
     {
-        ReverseIndex map1, map2;
-
         pthread_mutex_lock(&threadMemory.ReduceMutex);
         if (threadMemory.ReduceQueue.size() < 2)
         {
@@ -214,9 +211,9 @@ void* ReduceThread(void* args)
 
         // Get two maps from the queue
         // Use move semantics to avoid copying
-        map1 = move(threadMemory.ReduceQueue.front());
+        ReverseIndex map1 = move(threadMemory.ReduceQueue.front());
         threadMemory.ReduceQueue.pop();
-        map2 = move(threadMemory.ReduceQueue.front());
+        ReverseIndex map2 = move(threadMemory.ReduceQueue.front());
         threadMemory.ReduceQueue.pop();
         pthread_mutex_unlock(&threadMemory.ReduceMutex);
 
@@ -231,7 +228,7 @@ void* ReduceThread(void* args)
     return NULL;
 }
 
-bool CompareByFileIDCount(const pair<string, vector<int>>& a, const pair<string, vector<int>>& b)
+bool CompareByFileIDCount(const IndexEntry& a, const IndexEntry& b)
 {
     // Compare first by the count of associated file IDs and then alphabetically
     if (a.second.size() == b.second.size())
@@ -251,7 +248,7 @@ void WriteIndexToFiles(const ReverseIndex& finalIndex)
     }
 
     // Collect the entries from the finalIndex unordered_map into a vector of pairs
-    vector<pair<string, vector<int>>> sortedIndex(finalIndex.begin(), finalIndex.end());
+    vector<IndexEntry> sortedIndex(finalIndex.begin(), finalIndex.end());
 
     // Sort the vector based on the size of the fileID list in descending order
     sort(sortedIndex.begin(), sortedIndex.end(), CompareByFileIDCount);
@@ -318,7 +315,7 @@ int main(int argc, char** argv)
         fin >> datasetName;
 
         // Get file size
-        ifstream fileStream(datasetName, ios::binary | ios::ate);
+        ifstream fileStream(datasetName, ios::ate); // Move the file pointer to the end
         int fileSize = fileStream.tellg();
 
         fileBuckets.push_back({datasetName, fileSize});
@@ -365,9 +362,8 @@ int main(int argc, char** argv)
         }
         else
         {
-            int idx = threadID - mapperThreadsCount;
             reducerMemories.emplace_back(
-                idx + mapperThreadsCount, mapperThreadsCount, reducerThreadsCount, 
+                threadID, reducerThreadsCount, 
                 partialIndexes, barrier, reduceQueue, reduceMutex
             );
 
@@ -383,7 +379,6 @@ int main(int argc, char** argv)
 
     // Final index (after reduce phase)
     ReverseIndex finalIndex = move(reduceQueue.front());
-
     WriteIndexToFiles(finalIndex);
 
     pthread_barrier_destroy(&barrier);
