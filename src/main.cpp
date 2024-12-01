@@ -31,46 +31,54 @@ struct Chunk
 
 struct MapperThreadMemory
 {
-    MapperThreadMemory(int threadID, int mapperThreadsCount, vector<FileBucket>& fileBuckets,
-                       vector<ReverseIndex>& partialIndexes, pthread_barrier_t& mapperReducerBarrier,
-                       queue<Chunk>& chunkQueue, pthread_mutex_t& chunkMutex,
-                       queue<ReverseIndex>& reduceQueue, pthread_mutex_t& reduceMutex)
-        : ThreadID(threadID), MapperThreadsCount(mapperThreadsCount), FileBuckets(fileBuckets),
-          PartialIndexes(partialIndexes), MapperReducerBarrier(mapperReducerBarrier),
-          ChunkQueue(chunkQueue), ChunkMutex(chunkMutex), ReduceQueue(reduceQueue), ReduceMutex(reduceMutex)
+    MapperThreadMemory(vector<FileBucket>& fileBuckets
+        , queue<Chunk>& chunkQueue, pthread_mutex_t& chunkMutex
+        , queue<ReverseIndex>& reduceQueue, pthread_mutex_t& reduceMutex
+        , int& mappersDoneCount
+        , pthread_mutex_t& mappersCountMutex)
+            : FileBuckets(fileBuckets)
+            , ChunkQueue(chunkQueue)
+            , ReduceQueue(reduceQueue)
+            , ChunkMutex(chunkMutex)
+            , ReduceMutex(reduceMutex)
+            , MappersDoneCount(mappersDoneCount)
+            , MappersCountMutex(mappersCountMutex)
     {
     }
 
-    int ThreadID;
-    int MapperThreadsCount;
     // Dependencies and outputs
     vector<FileBucket>& FileBuckets;
-    vector<ReverseIndex>& PartialIndexes;
     queue<Chunk>& ChunkQueue;
     queue<ReverseIndex>& ReduceQueue;
-    pthread_barrier_t& MapperReducerBarrier;
     pthread_mutex_t& ChunkMutex;
     pthread_mutex_t& ReduceMutex;
+
+    int& MappersDoneCount;
+    pthread_mutex_t& MappersCountMutex;
 };
 
 struct ReducerThreadMemory
 {
-    ReducerThreadMemory(int threadID, int reducerThreadsCount,
-                        vector<ReverseIndex>& partialIndexes, pthread_barrier_t& mapperReducerBarrier,
-                        queue<ReverseIndex>& reduceQueue, pthread_mutex_t& reduceMutex)
-        : ThreadID(threadID), ReducerThreadsCount(reducerThreadsCount),
-          PartialIndexes(partialIndexes), MapperReducerBarrier(mapperReducerBarrier),
-          ReduceQueue(reduceQueue), ReduceMutex(reduceMutex)
+    ReducerThreadMemory(int mapperThreadsCount
+        , queue<ReverseIndex>& reduceQueue
+        , pthread_mutex_t& reduceMutex
+        , int& mappersCount
+        , pthread_mutex_t& mappersCountMutex)
+            : MapperThreadsCount(mapperThreadsCount)
+            , ReduceQueue(reduceQueue)
+            , ReduceMutex(reduceMutex)
+            , MappersDoneCount(mappersCount)
+            , MappersCountMutex(mappersCountMutex)
     {
     }
 
-    int ThreadID;
-    int ReducerThreadsCount;
     // Dependencies and outputs
-    vector<ReverseIndex>& PartialIndexes;
     queue<ReverseIndex>& ReduceQueue;
-    pthread_barrier_t& MapperReducerBarrier;
     pthread_mutex_t& ReduceMutex;
+
+    int MapperThreadsCount;
+    int& MappersDoneCount;
+    pthread_mutex_t& MappersCountMutex;
 };
 
 void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queue<Chunk>& chunkQueue)
@@ -165,28 +173,37 @@ void* MapThread(void* args)
 
     while (true)
     {
+        Chunk chunk;
+        bool hasChunk = false;
+
         pthread_mutex_lock(&threadMemory.ChunkMutex);
-        if (threadMemory.ChunkQueue.empty())
+        if (!threadMemory.ChunkQueue.empty())
         {
-            // No more chunks
-            pthread_mutex_unlock(&threadMemory.ChunkMutex);
-            break;
+            chunk = threadMemory.ChunkQueue.front();
+            threadMemory.ChunkQueue.pop();
+            hasChunk = true;
         }
-        Chunk chunk = threadMemory.ChunkQueue.front();
-        threadMemory.ChunkQueue.pop();
         pthread_mutex_unlock(&threadMemory.ChunkMutex);
 
-        // Map the chunk
-        Map(chunk, (threadMemory.PartialIndexes)[threadMemory.ThreadID]);
+        if (!hasChunk)
+        {
+            // No more chunks, mark this mapper thread as done
+            pthread_mutex_lock(&threadMemory.MappersCountMutex);
+            threadMemory.MappersDoneCount++;
+            pthread_mutex_unlock(&threadMemory.MappersCountMutex);
+            break;
+        }
+
+        // Step 2: Process the chunk (no locks needed here)
+        ReverseIndex partialIndex;
+        Map(chunk, partialIndex);
+
+        // Step 3: Push the partial index to the reduce queue
+        pthread_mutex_lock(&threadMemory.ReduceMutex);
+        threadMemory.ReduceQueue.push(move(partialIndex));
+        pthread_mutex_unlock(&threadMemory.ReduceMutex);
     }
 
-    // Push the thread's partial index for the Reducing phase
-    pthread_mutex_lock(&threadMemory.ReduceMutex);
-    threadMemory.ReduceQueue.push(move((threadMemory.PartialIndexes)[threadMemory.ThreadID]));
-    pthread_mutex_unlock(&threadMemory.ReduceMutex);
-
-    // Signal completion
-    pthread_barrier_wait(&threadMemory.MapperReducerBarrier);
     return NULL;
 }
 
@@ -195,18 +212,25 @@ void* ReduceThread(void* args)
 {
     ReducerThreadMemory& threadMemory = *((ReducerThreadMemory*)args);
 
-    // Wait until mappers are done
-    pthread_barrier_wait(&threadMemory.MapperReducerBarrier);
-
     while (true)
     {
         pthread_mutex_lock(&threadMemory.ReduceMutex);
+        pthread_mutex_lock(&threadMemory.MappersCountMutex);
         if (threadMemory.ReduceQueue.size() < 2)
         {
-            // Reduce phase is done
             pthread_mutex_unlock(&threadMemory.ReduceMutex);
-            break; 
+            if (threadMemory.MapperThreadsCount == threadMemory.MappersDoneCount)
+            {
+                // Reduce phase is done
+                pthread_mutex_unlock(&threadMemory.MappersCountMutex);
+                break; 
+            }
+
+            // Wait until the queue has at least 2 maps
+            pthread_mutex_unlock(&threadMemory.MappersCountMutex);
+            continue;
         }
+        pthread_mutex_unlock(&threadMemory.MappersCountMutex);
 
         // Get two maps from the queue
         // Use move semantics to avoid copying
@@ -256,10 +280,8 @@ void WriteIndexToFiles(const ReverseIndex& finalIndex)
     for (const auto& [word, fileIDs] : sortedIndex)
     {
         if (word.empty())
-        {
             continue;
-        }
-
+        
         // Determine the file name based on the starting letter
         char startingLetter = tolower(word[0]);
         string fileName(1, startingLetter);
@@ -326,20 +348,18 @@ int main(int argc, char** argv)
     int chunkSize = 15000;
     AddChunksToQueue(fileBuckets, chunkSize, chunkQueue);
 
-    // Initialize partial indexes for threads
-    vector<ReverseIndex> partialIndexes(mapperThreadsCount);
-
     // Create a queue for reducing phase
     queue<ReverseIndex> reduceQueue;
 
-    // Create and initialize barrier for synchronizing mapping and reducing phases
-    pthread_barrier_t barrier;
-    pthread_barrier_init(&barrier, nullptr, mapperThreadsCount + reducerThreadsCount);
+    // When all the mappers are done, the reducers can also end
+    int mappersDone = 0;
     // Initialize mutexes
     pthread_mutex_t chunkMutex;
     pthread_mutex_t reduceMutex;
+    pthread_mutex_t mappersDoneMutex;
     pthread_mutex_init(&chunkMutex, nullptr);
     pthread_mutex_init(&reduceMutex, nullptr);
+    pthread_mutex_init(&mappersDoneMutex, nullptr);
 
     // Create all threads (both mapping and reducing)
     vector<pthread_t> threads(mapperThreadsCount + reducerThreadsCount);
@@ -353,20 +373,18 @@ int main(int argc, char** argv)
         if (threadID < mapperThreadsCount)
         {
             mapperMemories.emplace_back(
-                threadID, mapperThreadsCount, fileBuckets, partialIndexes,
-                barrier, chunkQueue, chunkMutex, reduceQueue, reduceMutex
+                fileBuckets, chunkQueue, chunkMutex, reduceQueue, reduceMutex, mappersDone, mappersDoneMutex
             );
 
-            pthread_create(&threads[threadID], nullptr, MapThread, (void*)&mapperMemories.back());
+            pthread_create(&threads[threadID], nullptr, MapThread, &mapperMemories.back());
         }
         else
         {
             reducerMemories.emplace_back(
-                threadID, reducerThreadsCount, 
-                partialIndexes, barrier, reduceQueue, reduceMutex
+                mapperThreadsCount, reduceQueue, reduceMutex, mappersDone, mappersDoneMutex
             );
 
-            pthread_create(&threads[threadID], nullptr, ReduceThread, (void*)&reducerMemories.back());
+            pthread_create(&threads[threadID], nullptr, ReduceThread, &reducerMemories.back());
         }
     }
 
@@ -380,8 +398,8 @@ int main(int argc, char** argv)
     ReverseIndex finalIndex = move(reduceQueue.front());
     WriteIndexToFiles(finalIndex);
 
-    pthread_barrier_destroy(&barrier);
     pthread_mutex_destroy(&chunkMutex);
     pthread_mutex_destroy(&reduceMutex);
+    pthread_mutex_destroy(&mappersDoneMutex);
     return 0;
 }
