@@ -114,7 +114,7 @@ void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queu
     }
 }
 
-void Map(Chunk chunk, ReverseIndex& partialIndex)
+void Map(const Chunk& chunk, ReverseIndex& partialIndex)
 {
     ifstream fin(chunk.File);
     fin.seekg(chunk.Start);
@@ -207,7 +207,6 @@ void* MapThread(void* args)
     return NULL;
 }
 
-// Reducer thread function
 void* ReduceThread(void* args)
 {
     ReducerThreadMemory& threadMemory = *((ReducerThreadMemory*)args);
