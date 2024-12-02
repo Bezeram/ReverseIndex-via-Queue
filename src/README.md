@@ -62,5 +62,14 @@ while (true)
 ```
 
 # Map
-Inainte de aceasta operatie, am impartit fiecare fisier in mai multe fragmente de dimensiuni aproximativ egale folosind o dimensiune statica de caractere. Astfel se garanteaza o munca distribuita egala intre thread-uri (presupunand ca nu exista cuvinte exagerat de lungi). Aceste fragmente sunt pe urma introduse intr-o coada, de unde pot fi extrase de catre fiecare worker thread de tip Map, folosind un mutex pe coada. <br>
-Dupa ce un thread si-a extras un fragment de text, caruia ii este asociat un ID de fisier, acesta va rula procesul de mapare, care consta in asocierea cuvintelor cu indexul fisierului memorat de fragment folosind un hashmap.
+Inainte de aceasta operatie, am impartit fiecare fisier in mai multe fragmente de dimensiuni aproximativ egale folosind o dimensiune statica de caractere. Astfel se garanteaza o munca distribuita egala intre thread-uri (presupunand ca nu exista cuvinte exagerat de lungi). Aceste fragmente sunt pe urma introduse intr-o coada, de unde pot fi extrase de catre fiecare worker thread de tip Map, folosind un mutex pe coada. Aceasta coada face parte din memoria partajata a thread-urilor Map, pe langa alte esentiale cum ar fi mutex-urile, coada de Reduce in care se adauga rezultatele si contorul pentru thread-uri terminate. <br>
+Dupa ce un thread si-a extras un fragment de text din coada, caruia ii este asociat un ID de fisier, acesta va rula procesul de mapare, care consta in asocierea cuvintelor cu indexul fisierului memorat de fragment folosind un hashmap, acesta fiind reprezentarea unui Inverted Index in aceasta implementare. Odata terminat, respectivul hashmap este pasat mai departe pentru a fi procesat de catre thread-urile de tip Reduce.
+# Reduce
+Intrucat thread-urile Map produc hashmap-uri independente una de cealalta, thread-urile Reduce se pot apuca de procesat imediat cum primesc cel putin 2 harti
+de procesat. La fel ca la Map, se foloseste o coada din care fiecare thread extrage 2 hashmap-uri. Este nevoie de un mutex pentru operatiile pe coada, insa dupa s-au extras hartile, acestea se pot combina in memoria locala a thread-ului. Rezultatul este pe urma introdus inapoi in coada.<br>
+Thread-urile Reduce se opresc atunci cand mai ramane o harta in coada si toate thread-urile Map si-au terminat treaba, deci nu se mai produc harti de combinat.<br>
+## Scriere in fisiere
+Thread-urile Reduce sunt responsabile si de scrierea in fisiere, care se face astfel:<br>
+- Thread-ul 0 de tip Reducer parcurge ultimul Inverted Index ramas si imparte cuvintele in galeti corespondente fisierului in care trebuie scrise
+- Fiecare thread primeste o portiune din vectorul de galeti
+- Thread-urile scriu in fisierele corespondente cuvintele din galetile pe care le-au primit, asigurand ordinea corecta a cuvintelor impreuna cu fisierele in care s-au regasit
