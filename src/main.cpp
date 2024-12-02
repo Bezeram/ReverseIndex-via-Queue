@@ -7,6 +7,7 @@
 #include <queue>
 #include <cctype>
 #include <algorithm>
+#include <cmath>
 
 using namespace std;
 
@@ -67,7 +68,7 @@ struct ReducerThreadMemory
         , int& mappersCount
         , pthread_mutex_t& mappersCountMutex
         , pthread_barrier_t& fileOutputBarrier
-        , vector<ReverseIndex>& wordBuckets)
+        , vector<vector<IndexEntry>>& wordBuckets)
             : MapperThreadsCount(mapperThreadsCount)
             , ThreadID(threadID)
             , ReducerThreadsCount(reducerThreadsCount)
@@ -91,7 +92,7 @@ struct ReducerThreadMemory
     pthread_mutex_t& MappersCountMutex;
     pthread_barrier_t& FileOutputBarrier;
     // Printing to files
-    vector<ReverseIndex>& WordBuckets;
+    vector<vector<IndexEntry>>& WordBuckets;
 };
 
 void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queue<Chunk>& chunkQueue)
@@ -220,77 +221,65 @@ void* MapThread(void* args)
     return NULL;
 }
 
-void WriteIndexToFiles(ReverseIndex& finalIndex, vector<ReverseIndex>& wordBuckets, int threadID, int reducerThreadsCount)
+
+bool CompareByFileIDCount(const IndexEntry& a, const IndexEntry& b)
 {
-    if (threadID == 0)
+    // Compare first by the count of associated file IDs and then alphabetically
+    if (a.second.size() == b.second.size())
+        return a.first < b.first;  
+    return a.second.size() > b.second.size();
+}
+
+void WriteIndexToFiles(ReverseIndex& finalIndex, ReducerThreadMemory& threadMemory)
+{
+    if (threadMemory.ThreadID == 0)
     {
         // Singlethreaded, iterate through the finalIndex and fill the word buckets
         for (auto& [word, fileIDs] : finalIndex)
         {
             char index = word[0] - 'a';
-            wordBuckets[index][word] = move(fileIDs);
-        }
-
-        // print the buckets
-        for (int i = 0; i < 26; i++)
-        {
-            cout << char(i + 'a') << " ";
-            for (auto& [word, fileIDs] : wordBuckets[i])
-            {
-                cout << word << " ";
-                for (auto& fileID : fileIDs)
-                {
-                    cout << fileID << " ";
-                }
-                cout << endl;
-            }
-            cout << endl;
+            threadMemory.WordBuckets[index].push_back({word, fileIDs});
         }
     }
 
-    return;
+    // Wait until word buckets is actually initialised
+    pthread_barrier_wait(&threadMemory.FileOutputBarrier);
 
-    // Collect the entries from the finalIndex unordered_map into a vector of pairs
-    // vector<IndexEntry> sortedIndex(finalIndex.begin(), finalIndex.end());
+    double N = 26.0;
+    int start = threadMemory.ThreadID * ceil(N / threadMemory.ReducerThreadsCount);
+    int stop = min(N, (threadMemory.ThreadID + 1) * ceil(N / threadMemory.ReducerThreadsCount));
 
-    // // Sort the vector based on the size of the fileID list in descending order
-    // sort(sortedIndex.begin(), sortedIndex.end(), CompareByFileIDCount);
+    for (int i = start; i < stop; i++)
+    {
+        char startingLetter = 'a' + i;
+        string fileName(1, startingLetter);
+        fileName += ".txt";
 
-    // // Write the sorted entries to the output files
-    // for (const auto& [word, fileIDs] : sortedIndex)
-    // {
-    //     if (word.empty())
-    //         continue;
-        
-    //     // Determine the file name based on the starting letter
-    //     char startingLetter = tolower(word[0]);
-    //     string fileName(1, startingLetter);
-    //     fileName += ".txt";
+        // Sort by the count of associated file IDs and also in alphabetical order
+        vector<IndexEntry> sortedWords = threadMemory.WordBuckets[i];
+        sort(sortedWords.begin(), sortedWords.end(), CompareByFileIDCount);
 
-    //     // sort the file IDs in ascending order
-    //     auto sortedFileIDs = fileIDs;
-    //     sort(sortedFileIDs.begin(), sortedFileIDs.end());
+        ofstream outFile(fileName);
+        for (const auto& [word, fileIDs] : sortedWords)
+        {
+            outFile << word << ":[";
 
-    //     ofstream& outFile = wordBuckets[startingLetter];
-    //     outFile << word << ":[";
+            // sort the file IDs in ascending order
+            auto sortedFileIDs = fileIDs;
+            sort(sortedFileIDs.begin(), sortedFileIDs.end());
 
-    //     // Write the sorted file IDs
-    //     for (size_t i = 0; i < sortedFileIDs.size(); i++)
-    //     {
-    //         outFile << sortedFileIDs[i];
-    //         if (i < sortedFileIDs.size() - 1)
-    //         {
-    //             outFile << " ";
-    //         }
-    //     }
-    //     outFile << "]\n";
-    // }
-
-    // // Close all file streams
-    // for (auto& [_, stream] : wordBuckets)
-    // {
-    //     stream.close();
-    // }
+            // Write the sorted file IDs
+            for (size_t i = 0; i < sortedFileIDs.size(); i++)
+            {
+                outFile << sortedFileIDs[i];
+                if (i < sortedFileIDs.size() - 1)
+                {
+                    outFile << " ";
+                }
+            }
+            outFile << "]\n";
+        }
+    }
 }
 
 void* ReduceThread(void* args)
@@ -336,18 +325,9 @@ void* ReduceThread(void* args)
     // Wait until all reducers are done
     pthread_barrier_wait(&threadMemory.FileOutputBarrier);
 
-    WriteIndexToFiles(threadMemory.ReduceQueue.front(), threadMemory.WordBuckets, threadMemory.ThreadID, threadMemory.ReducerThreadsCount);
+    WriteIndexToFiles(threadMemory.ReduceQueue.front(), threadMemory);
     return NULL;
 }
-
-bool CompareByFileIDCount(const IndexEntry& a, const IndexEntry& b)
-{
-    // Compare first by the count of associated file IDs and then alphabetically
-    if (a.second.size() == b.second.size())
-        return a.first < b.first;  
-    return a.second.size() > b.second.size();
-}
-
 
 int main(int argc, char** argv)
 {
@@ -401,7 +381,7 @@ int main(int argc, char** argv)
 
     // Create all threads (both mapping and reducing)
     vector<pthread_t> threads(mapperThreadsCount + reducerThreadsCount);
-    vector<ReverseIndex> wordBuckets(26);
+    vector<vector<IndexEntry>> wordBuckets(26);
     vector<MapperThreadMemory> mapperMemories;
     vector<ReducerThreadMemory> reducerMemories;
     mapperMemories.reserve(mapperThreadsCount);
