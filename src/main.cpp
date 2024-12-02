@@ -59,16 +59,24 @@ struct MapperThreadMemory
 
 struct ReducerThreadMemory
 {
-    ReducerThreadMemory(int mapperThreadsCount
+    ReducerThreadMemory(int threadID
+        , int mapperThreadsCount
+        , int reducerThreadsCount
         , queue<ReverseIndex>& reduceQueue
         , pthread_mutex_t& reduceMutex
         , int& mappersCount
-        , pthread_mutex_t& mappersCountMutex)
+        , pthread_mutex_t& mappersCountMutex
+        , pthread_barrier_t& fileOutputBarrier
+        , vector<ReverseIndex>& wordBuckets)
             : MapperThreadsCount(mapperThreadsCount)
+            , ThreadID(threadID)
+            , ReducerThreadsCount(reducerThreadsCount)
             , ReduceQueue(reduceQueue)
             , ReduceMutex(reduceMutex)
             , MappersDoneCount(mappersCount)
             , MappersCountMutex(mappersCountMutex)
+            , FileOutputBarrier(fileOutputBarrier)
+            , WordBuckets(wordBuckets)
     {
     }
 
@@ -76,9 +84,14 @@ struct ReducerThreadMemory
     queue<ReverseIndex>& ReduceQueue;
     pthread_mutex_t& ReduceMutex;
 
+    int ThreadID;
+    int ReducerThreadsCount;
     int MapperThreadsCount;
     int& MappersDoneCount;
     pthread_mutex_t& MappersCountMutex;
+    pthread_barrier_t& FileOutputBarrier;
+    // Printing to files
+    vector<ReverseIndex>& WordBuckets;
 };
 
 void AddChunksToQueue(const vector<FileBucket>& fileBuckets, int chunkSize, queue<Chunk>& chunkQueue)
@@ -207,6 +220,79 @@ void* MapThread(void* args)
     return NULL;
 }
 
+void WriteIndexToFiles(ReverseIndex& finalIndex, vector<ReverseIndex>& wordBuckets, int threadID, int reducerThreadsCount)
+{
+    if (threadID == 0)
+    {
+        // Singlethreaded, iterate through the finalIndex and fill the word buckets
+        for (auto& [word, fileIDs] : finalIndex)
+        {
+            char index = word[0] - 'a';
+            wordBuckets[index][word] = move(fileIDs);
+        }
+
+        // print the buckets
+        for (int i = 0; i < 26; i++)
+        {
+            cout << char(i + 'a') << " ";
+            for (auto& [word, fileIDs] : wordBuckets[i])
+            {
+                cout << word << " ";
+                for (auto& fileID : fileIDs)
+                {
+                    cout << fileID << " ";
+                }
+                cout << endl;
+            }
+            cout << endl;
+        }
+    }
+
+    return;
+
+    // Collect the entries from the finalIndex unordered_map into a vector of pairs
+    // vector<IndexEntry> sortedIndex(finalIndex.begin(), finalIndex.end());
+
+    // // Sort the vector based on the size of the fileID list in descending order
+    // sort(sortedIndex.begin(), sortedIndex.end(), CompareByFileIDCount);
+
+    // // Write the sorted entries to the output files
+    // for (const auto& [word, fileIDs] : sortedIndex)
+    // {
+    //     if (word.empty())
+    //         continue;
+        
+    //     // Determine the file name based on the starting letter
+    //     char startingLetter = tolower(word[0]);
+    //     string fileName(1, startingLetter);
+    //     fileName += ".txt";
+
+    //     // sort the file IDs in ascending order
+    //     auto sortedFileIDs = fileIDs;
+    //     sort(sortedFileIDs.begin(), sortedFileIDs.end());
+
+    //     ofstream& outFile = wordBuckets[startingLetter];
+    //     outFile << word << ":[";
+
+    //     // Write the sorted file IDs
+    //     for (size_t i = 0; i < sortedFileIDs.size(); i++)
+    //     {
+    //         outFile << sortedFileIDs[i];
+    //         if (i < sortedFileIDs.size() - 1)
+    //         {
+    //             outFile << " ";
+    //         }
+    //     }
+    //     outFile << "]\n";
+    // }
+
+    // // Close all file streams
+    // for (auto& [_, stream] : wordBuckets)
+    // {
+    //     stream.close();
+    // }
+}
+
 void* ReduceThread(void* args)
 {
     ReducerThreadMemory& threadMemory = *((ReducerThreadMemory*)args);
@@ -222,7 +308,7 @@ void* ReduceThread(void* args)
             {
                 // Reduce phase is done
                 pthread_mutex_unlock(&threadMemory.MappersCountMutex);
-                break; 
+                break;
             }
 
             // Wait until the queue has at least 2 maps
@@ -247,6 +333,10 @@ void* ReduceThread(void* args)
         pthread_mutex_unlock(&threadMemory.ReduceMutex);
     }
 
+    // Wait until all reducers are done
+    pthread_barrier_wait(&threadMemory.FileOutputBarrier);
+
+    WriteIndexToFiles(threadMemory.ReduceQueue.front(), threadMemory.WordBuckets, threadMemory.ThreadID, threadMemory.ReducerThreadsCount);
     return NULL;
 }
 
@@ -258,59 +348,6 @@ bool CompareByFileIDCount(const IndexEntry& a, const IndexEntry& b)
     return a.second.size() > b.second.size();
 }
 
-void WriteIndexToFiles(const ReverseIndex& finalIndex)
-{
-    unordered_map<char, ofstream> fileStreams;
-    // open all files in out mode
-    for (int c = 'a'; c <= 'z'; c++)
-    {
-        string fileName(1, c);
-        fileName += ".txt";
-        fileStreams[c].open(fileName);
-    }
-
-    // Collect the entries from the finalIndex unordered_map into a vector of pairs
-    vector<IndexEntry> sortedIndex(finalIndex.begin(), finalIndex.end());
-
-    // Sort the vector based on the size of the fileID list in descending order
-    sort(sortedIndex.begin(), sortedIndex.end(), CompareByFileIDCount);
-
-    // Write the sorted entries to the output files
-    for (const auto& [word, fileIDs] : sortedIndex)
-    {
-        if (word.empty())
-            continue;
-        
-        // Determine the file name based on the starting letter
-        char startingLetter = tolower(word[0]);
-        string fileName(1, startingLetter);
-        fileName += ".txt";
-
-        // sort the file IDs in ascending order
-        auto sortedFileIDs = fileIDs;
-        sort(sortedFileIDs.begin(), sortedFileIDs.end());
-
-        ofstream& outFile = fileStreams[startingLetter];
-        outFile << word << ":[";
-
-        // Write the sorted file IDs
-        for (size_t i = 0; i < sortedFileIDs.size(); i++)
-        {
-            outFile << sortedFileIDs[i];
-            if (i < sortedFileIDs.size() - 1)
-            {
-                outFile << " ";
-            }
-        }
-        outFile << "]\n";
-    }
-
-    // Close all file streams
-    for (auto& [_, stream] : fileStreams)
-    {
-        stream.close();
-    }
-}
 
 int main(int argc, char** argv)
 {
@@ -352,16 +389,19 @@ int main(int argc, char** argv)
 
     // When all the mappers are done, the reducers can also end
     int mappersDone = 0;
-    // Initialize mutexes
+    // Initialize mutexes and the barrier
     pthread_mutex_t chunkMutex;
     pthread_mutex_t reduceMutex;
     pthread_mutex_t mappersDoneMutex;
+    pthread_barrier_t fileOutputBarrier;
     pthread_mutex_init(&chunkMutex, nullptr);
     pthread_mutex_init(&reduceMutex, nullptr);
     pthread_mutex_init(&mappersDoneMutex, nullptr);
+    pthread_barrier_init(&fileOutputBarrier, nullptr, reducerThreadsCount);
 
     // Create all threads (both mapping and reducing)
     vector<pthread_t> threads(mapperThreadsCount + reducerThreadsCount);
+    vector<ReverseIndex> wordBuckets(26);
     vector<MapperThreadMemory> mapperMemories;
     vector<ReducerThreadMemory> reducerMemories;
     mapperMemories.reserve(mapperThreadsCount);
@@ -380,7 +420,7 @@ int main(int argc, char** argv)
         else
         {
             reducerMemories.emplace_back(
-                mapperThreadsCount, reduceQueue, reduceMutex, mappersDone, mappersDoneMutex
+                threadID - mapperThreadsCount, mapperThreadsCount, reducerThreadsCount, reduceQueue, reduceMutex, mappersDone, mappersDoneMutex, fileOutputBarrier, wordBuckets
             );
 
             pthread_create(&threads[threadID], nullptr, ReduceThread, &reducerMemories.back());
@@ -393,12 +433,9 @@ int main(int argc, char** argv)
         pthread_join(thread, nullptr);
     }
 
-    // Final index (after reduce phase)
-    ReverseIndex finalIndex = move(reduceQueue.front());
-    WriteIndexToFiles(finalIndex);
-
     pthread_mutex_destroy(&chunkMutex);
     pthread_mutex_destroy(&reduceMutex);
     pthread_mutex_destroy(&mappersDoneMutex);
+    pthread_barrier_destroy(&fileOutputBarrier);
     return 0;
 }
